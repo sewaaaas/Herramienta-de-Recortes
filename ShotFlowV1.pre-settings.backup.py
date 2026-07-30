@@ -1,0 +1,789 @@
+import ctypes
+import logging
+import math
+import os
+import sys
+from ctypes import wintypes
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+from PyQt6.QtCore import QAbstractNativeEventFilter, QPoint, QPointF, QRect, Qt, QTimer
+from PyQt6.QtGui import QColor, QGuiApplication, QIcon, QKeySequence, QPainter, QPen, QPixmap, QPolygonF, QRegion, QShortcut
+from PyQt6.QtWidgets import (
+    QApplication,
+    QButtonGroup,
+    QComboBox,
+    QFileDialog,
+    QHBoxLayout,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QSystemTrayIcon,
+    QWidget,
+)
+
+def resource_path(relative_path):
+    if hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS) / relative_path
+
+    return Path(__file__).resolve().parent / relative_path
+
+
+APP_DIR = Path(__file__).resolve().parent
+ICON_FILE = resource_path("assets/Tecniflow-logo.ico")
+
+
+def configure_logging():
+    logger = logging.getLogger("recortes")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    for handler in logger.handlers:
+        if isinstance(handler, RotatingFileHandler):
+            return logger, Path(handler.baseFilename)
+
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    user_log_dir = Path(local_app_data) / "ShotFlow" if local_app_data else Path.home() / "AppData" / "Local" / "ShotFlow"
+    candidates = (user_log_dir / "herramienta_recortes.log", APP_DIR / "herramienta_recortes.log")
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
+    for candidate in candidates:
+        try:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            handler = RotatingFileHandler(
+                candidate,
+                maxBytes=1024 * 1024,
+                backupCount=3,
+                encoding="utf-8",
+            )
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+            return logger, candidate
+        except OSError:
+            continue
+
+    # No impide iniciar la interfaz si ninguna ubicación permite escribir.
+    logger.addHandler(logging.NullHandler())
+    return logger, candidates[0]
+
+
+log, LOG_FILE = configure_logging()
+
+IS_WINDOWS = sys.platform == "win32"
+WM_HOTKEY = 0x0312
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_NOREPEAT = 0x4000
+VK_SNAPSHOT = 0x2C
+VK_S = 0x53
+HOTKEY_PRINT = 1
+HOTKEY_CTRL_SHIFT_S = 2
+ERROR_ALREADY_EXISTS = 183
+MUTEX_NAME = "Local\\ShotFlow_SingleInstance"
+
+
+if IS_WINDOWS:
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.RegisterHotKey.argtypes = (wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT)
+    user32.RegisterHotKey.restype = wintypes.BOOL
+    user32.UnregisterHotKey.argtypes = (wintypes.HWND, ctypes.c_int)
+    user32.UnregisterHotKey.restype = wintypes.BOOL
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+
+class SingleInstanceMutex:
+    def __init__(self, name=MUTEX_NAME):
+        self.name = name
+        self.handle = None
+
+    def acquire(self):
+        if not IS_WINDOWS:
+            return "acquired", None, None
+
+        ctypes.set_last_error(0)
+        handle = kernel32.CreateMutexW(None, False, self.name)
+        error_code = ctypes.get_last_error()
+        if not handle:
+            message = ctypes.FormatError(error_code).strip() if error_code else "Windows no proporcionó detalles."
+            log.error("No se pudo crear el mutex %s. Error %s: %s", self.name, error_code, message)
+            return "error", error_code, message
+
+        self.handle = handle
+        if error_code == ERROR_ALREADY_EXISTS:
+            log.warning("Se rechazó una segunda instancia de ShotFlow")
+            self.release()
+            return "already_running", error_code, ctypes.FormatError(error_code).strip()
+
+        log.info("Mutex de instancia única adquirido: %s", self.name)
+        return "acquired", None, None
+
+    def release(self):
+        if not IS_WINDOWS or self.handle is None:
+            return
+        handle, self.handle = self.handle, None
+        if not kernel32.CloseHandle(handle):
+            code = ctypes.get_last_error()
+            log.error("No se pudo liberar el mutex. Error %s: %s", code, ctypes.FormatError(code).strip())
+        else:
+            log.info("Mutex de instancia única liberado")
+
+
+def draw_arrow(painter, start, end, color, width=3):
+    pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(color)
+    painter.drawLine(start, end)
+    dx, dy = end.x() - start.x(), end.y() - start.y()
+    if dx == 0 and dy == 0:
+        return
+    angle = math.atan2(dy, dx)
+    size = max(10, width * 4)
+    opening = math.radians(28)
+    p1 = QPointF(end.x() - size * math.cos(angle - opening), end.y() - size * math.sin(angle - opening))
+    p2 = QPointF(end.x() - size * math.cos(angle + opening), end.y() - size * math.sin(angle + opening))
+    painter.drawPolygon(QPolygonF([QPointF(end), p1, p2]))
+
+
+def render_shape(painter, tool, start, end, color, width=3):
+    if tool == "rectangle":
+        painter.setPen(QPen(color, width))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(QRect(start, end).normalized())
+    elif tool == "ellipse":
+        painter.setPen(QPen(color, width))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QRect(start, end).normalized())
+    elif tool == "arrow":
+        draw_arrow(painter, start, end, color, width)
+
+
+class HotkeyFilter(QAbstractNativeEventFilter):
+    """Recibe WM_HOTKEY a nivel del hilo; no necesita una ventana oculta."""
+
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+        self.registered = []
+        self.registration_results = {}
+
+    def register_all(self):
+        self.registration_results = {}
+        if not IS_WINDOWS:
+            log.warning("Los atajos globales solo están disponibles en Windows")
+            for name in ("Impr Pant", "Ctrl+Shift+S"):
+                self.registration_results[name] = {
+                    "success": False,
+                    "error_code": None,
+                    "error_message": "Disponible únicamente en Windows.",
+                }
+            return self.registration_results
+        self.registration_results["Impr Pant"] = self._register(
+            HOTKEY_PRINT, MOD_NOREPEAT, VK_SNAPSHOT, "Impr Pant"
+        )
+        self.registration_results["Ctrl+Shift+S"] = self._register(
+            HOTKEY_CTRL_SHIFT_S,
+            MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
+            VK_S,
+            "Ctrl+Shift+S",
+        )
+        return self.registration_results
+
+    def _register(self, hotkey_id, modifiers, key, name):
+        ctypes.set_last_error(0)
+        # HWND=None registra el atajo en la cola del hilo actual.
+        if user32.RegisterHotKey(None, hotkey_id, modifiers, key):
+            self.registered.append(hotkey_id)
+            log.info("Atajo registrado: %s", name)
+            return {"success": True, "error_code": None, "error_message": None}
+
+        code = ctypes.get_last_error()
+        message = ctypes.FormatError(code).strip() if code else "Windows no proporcionó un código de error."
+        log.error("No se pudo registrar %s. Error %s: %s", name, code, message)
+        return {"success": False, "error_code": code, "error_message": message}
+
+    def nativeEventFilter(self, event_type, message):
+        if IS_WINDOWS:
+            msg = wintypes.MSG.from_address(int(message))
+            if msg.message == WM_HOTKEY and int(msg.wParam) in self.registered:
+                # Se agenda para no crear ventanas dentro del despacho nativo.
+                QTimer.singleShot(0, self.callback)
+                return True, 0
+        return False, 0
+
+    def unregister_all(self):
+        if IS_WINDOWS:
+            for hotkey_id in self.registered:
+                user32.UnregisterHotKey(None, hotkey_id)
+        self.registered.clear()
+
+
+class FloatingToolbar(QWidget):
+    COLORS = ("#e74c3c", "#2ecc71", "#3498db", "#f1c40f", "#000000", "#ffffff")
+
+    def __init__(self, overlay):
+        super().__init__(overlay)
+        self.overlay = overlay
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        self.tool_group = QButtonGroup(self)
+        self.tool_group.setExclusive(True)
+        self.move_button = QPushButton("✥")
+        self.rect_button = QPushButton("▭")
+        self.ellipse_button = QPushButton("○")
+        self.arrow_button = QPushButton("➜")
+        for button in (
+            self.move_button,
+            self.rect_button,
+            self.ellipse_button,
+            self.arrow_button,
+        ):
+            button.setCheckable(True)
+            self.tool_group.addButton(button)
+            layout.addWidget(button)
+        self.move_button.setToolTip("Mover selección")
+        self.rect_button.setToolTip("Rectángulo")
+        self.ellipse_button.setToolTip("Círculo / Elipse")
+        self.arrow_button.setToolTip("Flecha")
+        self.move_button.clicked.connect(lambda: overlay.set_current_tool("move"))
+        self.rect_button.clicked.connect(lambda: overlay.set_current_tool("rectangle"))
+        self.ellipse_button.clicked.connect(lambda: overlay.set_current_tool("ellipse"))
+        self.arrow_button.clicked.connect(lambda: overlay.set_current_tool("arrow"))
+
+        tool_buttons = {
+            "move": self.move_button,
+            "rectangle": self.rect_button,
+            "ellipse": self.ellipse_button,
+            "arrow": self.arrow_button,
+        }
+        if overlay.current_tool in tool_buttons:
+            tool_buttons[overlay.current_tool].setChecked(True)
+
+        self.width_combo = QComboBox()
+        self.width_combo.setToolTip("Grosor de línea")
+        self.width_combo.setFixedWidth(66)
+        for width in (2, 4, 6, 8):
+            self.width_combo.addItem(f"{width} px", width)
+        width_index = self.width_combo.findData(overlay.current_width)
+        self.width_combo.setCurrentIndex(max(0, width_index))
+        self.width_combo.currentIndexChanged.connect(self.select_width)
+        layout.addWidget(self.width_combo)
+
+        undo_button = QPushButton("↶")
+        undo_button.setToolTip("Deshacer última anotación (Ctrl+Z)")
+        undo_button.clicked.connect(overlay.undo_last_annotation)
+        layout.addWidget(undo_button)
+
+        self.color_buttons = []
+        for color in self.COLORS:
+            button = QPushButton()
+            button.setFixedSize(20, 20)
+            button.clicked.connect(lambda checked=False, c=color: self.select_color(c))
+            self.color_buttons.append(button)
+            layout.addWidget(button)
+        self.select_color(overlay.current_color.name())
+
+        copy_button = QPushButton("Copiar")
+        save_button = QPushButton("Guardar")
+        copy_button.clicked.connect(overlay.copy_and_close)
+        save_button.clicked.connect(self.save)
+        layout.addWidget(copy_button)
+        layout.addWidget(save_button)
+        self.setStyleSheet(
+            "QWidget{background:#292929;border-radius:6px}"
+            "QPushButton{background:#414141;color:white;border:0;padding:6px 10px;border-radius:4px}"
+            "QPushButton:hover{background:#555} QPushButton:checked{background:#0878d1}"
+            "QComboBox{background:#414141;color:white;border:0;padding:5px;border-radius:4px}"
+            "QComboBox QAbstractItemView{background:#414141;color:white;selection-background-color:#0878d1}"
+        )
+
+    def select_color(self, color):
+        self.overlay.current_color = QColor(color)
+        for button, value in zip(self.color_buttons, self.COLORS):
+            border = "3px solid white" if value == color else "2px solid #888"
+            button.setStyleSheet(f"background:{value};border:{border};border-radius:10px;padding:0")
+
+    def select_width(self):
+        width = self.width_combo.currentData()
+        if width is not None:
+            self.overlay.current_width = int(width)
+
+    def save(self):
+        default = f"captura_{datetime.now():%Y%m%d_%H%M%S}.png"
+        filename, _ = QFileDialog.getSaveFileName(self, "Guardar captura", default, "PNG (*.png)")
+        if not filename:
+            return
+        if not filename.lower().endswith(".png"):
+            filename += ".png"
+
+        try:
+            pixmap = self.overlay.final_pixmap()
+            if pixmap is None or pixmap.isNull():
+                log.error("No se pudo guardar %s: el recorte final no es un QPixmap válido", filename)
+                QMessageBox.warning(
+                    self,
+                    "No se pudo guardar la captura",
+                    "La imagen final no es válida. La captura permanecerá abierta para que puedas intentarlo de nuevo.",
+                )
+                return
+            if pixmap.save(filename, "PNG"):
+                log.info("Captura guardada en %s", filename)
+                self.overlay.close_session()
+                return
+
+            log.error("QPixmap.save devolvió False al guardar %s", filename)
+            QMessageBox.warning(
+                self,
+                "No se pudo guardar la captura",
+                f"No se pudo guardar la imagen en:\n{filename}\n\n"
+                "Verifica los permisos de la carpeta, el espacio disponible y la extensión del archivo.",
+            )
+        except Exception:
+            log.exception("Error inesperado al guardar la captura en %s", filename)
+            QMessageBox.warning(
+                self,
+                "No se pudo guardar la captura",
+                f"Ocurrió un error al guardar la imagen en:\n{filename}\n\n"
+                "La captura permanecerá abierta para que puedas intentarlo de nuevo.",
+            )
+
+
+class Overlay(QWidget):
+    def __init__(self, screen, controller):
+        super().__init__()
+        self.controller = controller
+        self.dpr = screen.devicePixelRatio()
+        self.background = screen.grabWindow(0)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+        self.setGeometry(screen.geometry())
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.selecting = False
+        self.origin = None
+        self.selection = QRect()
+        self.capture = None
+        self.toolbar = None
+        self.current_tool = None
+        self.current_color = QColor("#e74c3c")
+        self.current_width = 4
+        self.annotations = []
+        self.drawing = False
+        self.shape_start = None
+        self.shape_end = None
+        self.moving_selection = False
+        self.move_start = None
+        self.selection_start_rect = QRect()
+        self.shortcuts = []
+        self._install_shortcuts()
+
+    def _install_shortcuts(self):
+        bindings = (
+            (QKeySequence(Qt.Key.Key_Escape), self.close_session),
+            (QKeySequence.StandardKey.Copy, self.copy_and_close),
+            (QKeySequence.StandardKey.Undo, self.undo_last_annotation),
+        )
+        for sequence, callback in bindings:
+            shortcut = QShortcut(sequence, self)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(callback)
+            self.shortcuts.append(shortcut)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.drawPixmap(0, 0, self.background)
+        shade = QColor(0, 0, 0, 105)
+        if not self.selection.isValid():
+            painter.fillRect(self.rect(), shade)
+            return
+        dark = QRegion(self.rect()).subtracted(QRegion(self.selection))
+        painter.setClipRegion(dark)
+        painter.fillRect(self.rect(), shade)
+        painter.setClipRegion(QRegion(self.rect()))
+        painter.setPen(QPen(QColor("#0878d1"), 2))
+        painter.drawRect(self.selection)
+        painter.setClipRect(self.selection)
+        for shape in self.annotations:
+            render_shape(painter, shape[0], shape[1], shape[2], shape[3], shape[4])
+        if self.drawing:
+            render_shape(
+                painter,
+                self.current_tool,
+                self.shape_start,
+                self.shape_end,
+                self.current_color,
+                self.current_width,
+            )
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        pos = event.position().toPoint()
+        if not self.selection.isValid():
+            self._start_selection(pos)
+        elif self.selection.contains(pos) and self.current_tool == "move":
+            self.moving_selection = True
+            self.move_start = pos
+            self.selection_start_rect = QRect(self.selection)
+        elif self.selection.contains(pos) and self.current_tool in ("rectangle", "ellipse", "arrow"):
+            self.drawing = True
+            self.shape_start = self.shape_end = pos
+        elif not self.selection.contains(pos):
+            self._reset()
+            self._start_selection(pos)
+
+    def mouseMoveEvent(self, event):
+        pos = event.position().toPoint()
+        if self.selecting:
+            self.selection = QRect(self.origin, pos).normalized()
+            self.update()
+        elif self.moving_selection:
+            self._move_selection(pos)
+        elif self.drawing:
+            self.shape_end = pos
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        pos = event.position().toPoint()
+        if self.selecting:
+            self.selecting = False
+            self.selection = QRect(self.origin, pos).normalized()
+            if self.selection.width() < 10 or self.selection.height() < 10:
+                self.selection = QRect()
+                self.update()
+                return
+            self.set_current_tool("move")
+            self._capture_selection()
+            self._show_toolbar()
+            self.update()
+        elif self.moving_selection:
+            self._move_selection(pos)
+            self.moving_selection = False
+            self.move_start = None
+            self.selection_start_rect = QRect()
+            self._capture_selection()
+            self.update()
+        elif self.drawing:
+            self.drawing = False
+            self.shape_end = pos
+            if abs(pos.x() - self.shape_start.x()) > 3 or abs(pos.y() - self.shape_start.y()) > 3:
+                self.annotations.append(
+                    (
+                        self.current_tool,
+                        self.shape_start,
+                        pos,
+                        QColor(self.current_color),
+                        self.current_width,
+                    )
+                )
+            self.shape_start = self.shape_end = None
+            self.update()
+
+    def set_current_tool(self, tool):
+        self.current_tool = tool
+        if tool == "move":
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+        else:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def undo_last_annotation(self):
+        if self.annotations:
+            self.annotations.pop()
+            self.update()
+
+    def _move_selection(self, pos):
+        if not self.moving_selection or self.move_start is None:
+            return
+
+        delta = pos - self.move_start
+        original = self.selection_start_rect
+        max_x = max(0, self.width() - original.width())
+        max_y = max(0, self.height() - original.height())
+        new_x = min(max(original.x() + delta.x(), 0), max_x)
+        new_y = min(max(original.y() + delta.y(), 0), max_y)
+        new_selection = QRect(new_x, new_y, original.width(), original.height())
+
+        applied_delta = new_selection.topLeft() - self.selection.topLeft()
+        if not applied_delta.isNull():
+            self.selection = new_selection
+            self.annotations = [
+                (tool, start + applied_delta, end + applied_delta, color, width)
+                for tool, start, end, color, width in self.annotations
+            ]
+            self._position_toolbar()
+            self.update()
+
+    def _start_selection(self, pos):
+        self.origin = pos
+        self.selection = QRect(pos, pos)
+        self.selecting = True
+        self.update()
+
+    def _reset(self):
+        if self.toolbar:
+            self.toolbar.deleteLater()
+        self.toolbar = None
+        self.selection = QRect()
+        self.capture = None
+        self.annotations.clear()
+        self.current_tool = None
+        self.moving_selection = False
+        self.move_start = None
+        self.selection_start_rect = QRect()
+        self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def _capture_selection(self):
+        dpr = self.dpr
+        rect = QRect(
+            round(self.selection.x() * dpr), round(self.selection.y() * dpr),
+            round(self.selection.width() * dpr), round(self.selection.height() * dpr),
+        )
+        self.capture = self.background.copy(rect)
+        self.capture.setDevicePixelRatio(dpr)
+
+    def _show_toolbar(self):
+        self.toolbar = FloatingToolbar(self)
+        self.toolbar.adjustSize()
+        self._position_toolbar()
+        self.toolbar.show()
+        self.toolbar.raise_()
+
+    def _position_toolbar(self):
+        if self.toolbar is None:
+            return
+        size = self.toolbar.size()
+        max_x = max(0, self.width() - size.width())
+        max_y = max(0, self.height() - size.height())
+        x = min(max(0, self.selection.right() - size.width()), max_x)
+        y = self.selection.bottom() + 8
+        if y + size.height() > self.height():
+            y = self.selection.top() - size.height() - 8
+        self.toolbar.move(x, min(max(0, y), max_y))
+
+    def _pixmap_point(self, point):
+        """Convierte coordenadas del overlay a coordenadas lógicas del recorte.
+
+        QPainter conoce el devicePixelRatio del QPixmap y realiza por sí mismo
+        la conversión de estas coordenadas lógicas a píxeles físicos. Multiplicar
+        aquí por DPR desplazaría y agrandaría las anotaciones en pantallas con
+        escala de 125 %, 150 %, etc.
+        """
+        origin = self.selection.topLeft()
+        return QPoint(point.x() - origin.x(), point.y() - origin.y())
+
+    def final_pixmap(self):
+        result = self.capture.copy()
+        painter = QPainter(result)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for tool, start, end, color, width in self.annotations:
+            render_shape(painter, tool, self._pixmap_point(start), self._pixmap_point(end), color, width)
+        painter.end()
+        return result
+
+    def copy_and_close(self):
+        if self.capture is not None:
+            QApplication.clipboard().setPixmap(self.final_pixmap())
+            self.close_session()
+
+    def keyPressEvent(self, event):
+        # Los QShortcut cubren también el foco en la barra. Este bloque queda como
+        # respaldo únicamente si los shortcuts se deshabilitan deliberadamente.
+        if any(shortcut.isEnabled() for shortcut in self.shortcuts):
+            super().keyPressEvent(event)
+            return
+        if event.key() == Qt.Key.Key_Escape:
+            self.close_session()
+        elif event.matches(QKeySequence.StandardKey.Undo):
+            self.undo_last_annotation()
+        elif event.matches(QKeySequence.StandardKey.Copy):
+            self.copy_and_close()
+
+    def close_session(self):
+        self.controller.finish_capture()
+
+
+class Controller:
+    def __init__(self, app, instance_mutex):
+        self.app = app
+        self.instance_mutex = instance_mutex
+        self.overlays = []
+        self.capturing = False
+        self.cleaned_up = False
+        self.native_filter_installed = False
+
+        self.hotkeys = HotkeyFilter(self.take_capture)
+        self.app.installNativeEventFilter(self.hotkeys)
+        self.native_filter_installed = True
+        self.hotkey_results = self.hotkeys.register_all()
+
+        # Referencias persistentes: PyQt no debe recolectar menú ni acciones.
+        self.tray = QSystemTrayIcon(QIcon(str(ICON_FILE)), self.app)
+        self.tray.setToolTip("Herramienta de Recortes")
+        self.menu = QMenu()
+        self.action_capture = self.menu.addAction("Tomar recorte   (Impr Pant / Ctrl+Shift+S)")
+        self.action_capture.triggered.connect(self.take_capture)
+        self.menu.addSeparator()
+        self.action_quit = self.menu.addAction("Salir")
+        self.action_quit.triggered.connect(self.quit)
+        self.tray.setContextMenu(self.menu)
+        self.tray.activated.connect(self._tray_activated)
+        self.tray.show()
+        log.info("Icono solicitado. visible=%s, bandeja_disponible=%s", self.tray.isVisible(), QSystemTrayIcon.isSystemTrayAvailable())
+        self.app.aboutToQuit.connect(self.cleanup)
+        QTimer.singleShot(700, self._announce)
+
+    def _announce(self):
+        failed = [name for name, result in self.hotkey_results.items() if not result["success"]]
+        if len(failed) == len(self.hotkey_results):
+            self.tray.showMessage(
+                "ShotFlow activo con atajos no disponibles",
+                "Impr Pant y Ctrl+Shift+S no pudieron registrarse. Inicia las capturas desde el icono de bandeja.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                6000,
+            )
+            return
+        if failed:
+            names = " y ".join(failed)
+            self.tray.showMessage(
+                "ShotFlow activo con un atajo no disponible",
+                f"{names} no pudo registrarse. Es posible que Windows u otra aplicación esté usando ese atajo.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                6000,
+            )
+            return
+        self.tray.showMessage(
+            "Herramienta de Recortes activa",
+            "Está en la bandeja. Usa Impr Pant o Ctrl+Shift+S.",
+            QSystemTrayIcon.MessageIcon.Information,
+            4000,
+        )
+
+    def _tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            self.take_capture()
+
+    def take_capture(self):
+        if self.capturing:
+            return
+        self.capturing = True
+        self.overlays = [Overlay(screen, self) for screen in QGuiApplication.screens()]
+        for overlay in self.overlays:
+            overlay.show()
+            overlay.raise_()
+        if self.overlays:
+            self.overlays[0].activateWindow()
+            self.overlays[0].setFocus()
+        log.info("Captura iniciada en %s pantalla(s)", len(self.overlays))
+
+    def finish_capture(self):
+        overlays, self.overlays = self.overlays, []
+        self.capturing = False
+        for overlay in overlays:
+            overlay.close()
+            overlay.deleteLater()
+        log.info("Captura finalizada; aplicación continúa en bandeja")
+
+    def quit(self):
+        self.cleanup()
+        self.app.quit()
+
+    def cleanup(self):
+        if self.cleaned_up:
+            return
+        self.cleaned_up = True
+
+        overlays, self.overlays = self.overlays, []
+        self.capturing = False
+        for overlay in overlays:
+            try:
+                overlay.close()
+                overlay.deleteLater()
+            except Exception:
+                log.exception("Error al cerrar un overlay durante la limpieza")
+
+        try:
+            self.hotkeys.unregister_all()
+        except Exception:
+            log.exception("Error al desregistrar los atajos globales")
+
+        if self.native_filter_installed:
+            try:
+                self.app.removeNativeEventFilter(self.hotkeys)
+            except Exception:
+                log.exception("Error al retirar el filtro nativo")
+            finally:
+                self.native_filter_installed = False
+
+        try:
+            self.tray.hide()
+        except Exception:
+            log.exception("Error al ocultar el icono de bandeja")
+
+        try:
+            self.instance_mutex.release()
+        except Exception:
+            log.exception("Error al liberar el mutex de instancia única")
+
+        log.info("Aplicación cerrada y recursos liberados")
+
+
+def main():
+    log.info("Iniciando aplicación")
+    app = QApplication(sys.argv)
+    app.setApplicationName("Herramienta de Recortes")
+    app.setWindowIcon(QIcon(str(ICON_FILE)))
+    app.setQuitOnLastWindowClosed(False)
+
+    instance_mutex = SingleInstanceMutex()
+    mutex_status, error_code, error_message = instance_mutex.acquire()
+    if mutex_status == "already_running":
+        QMessageBox.information(
+            None,
+            "ShotFlow",
+            "ShotFlow ya se está ejecutando.\nRevisa el icono en la bandeja del sistema.",
+        )
+        return 0
+    if mutex_status == "error":
+        QMessageBox.critical(
+            None,
+            "ShotFlow no pudo iniciarse",
+            "No se pudo comprobar si ShotFlow ya estaba ejecutándose.\n\n"
+            f"Error de Windows {error_code}: {error_message}",
+        )
+        return 1
+
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        QMessageBox.critical(
+            None,
+            "Herramienta de Recortes",
+            "Windows no informó una bandeja del sistema disponible.\n\n"
+            f"Consulta el registro:\n{LOG_FILE}",
+        )
+        instance_mutex.release()
+        return 1
+    # La referencia vive tanto en una variable local como en QApplication.
+    try:
+        controller = Controller(app, instance_mutex)
+    except Exception:
+        instance_mutex.release()
+        raise
+    app.controller = controller
+    return app.exec()
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception:
+        log.exception("Error fatal")
+        raise
