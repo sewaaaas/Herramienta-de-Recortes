@@ -2,7 +2,9 @@
 
 ShotFlow es una herramienta de capturas de pantalla para Windows, hecha con Python y PyQt6.
 
-La creé como un proyecto personal para tener una forma práctica de recortar, marcar y copiar imágenes sin salir del escritorio.
+## ¿Por qué la creé?
+
+ShotFlow nació al observar que algunos usuarios tenían dificultades para hacer capturas de pantalla y añadir anotaciones, por lo que recurrían a Paint. Además, las restricciones de seguridad del entorno corporativo limitaban el uso de herramientas externas. Por eso decidí crear una alternativa sencilla para capturar, señalar y compartir imágenes de forma más práctica.
 
 ## Qué permite hacer
 
